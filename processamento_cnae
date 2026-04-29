@@ -1,0 +1,265 @@
+# ==============================================================================
+# PROCESSAMENTO — CNAE (todas as versões)
+# Entrada:  coleta/dados_brutos/cnae_{versao}.{ext}  +  manifest_cnae.csv
+# Saída:    processamento/dados_processados/cnae_{versao}.csv  (por versão)
+#           processamento/dados_processados/cnae_todas_versoes.csv  (empilhado)
+# ==============================================================================
+# Schema de saída (comum a todas as versões):
+#   versao_cnae | cod_secao | cod_divisao | cod_grupo | cod_classe |
+#   cod_subclasse | nome_subclasse | nome_original
+# ==============================================================================
+
+library(readxl)
+library(dplyr)
+library(stringi)
+library(stringr)
+library(readr)
+library(glue)
+
+dir.create("processamento/dados_processados", recursive = TRUE, showWarnings = FALSE)
+
+# ------------------------------------------------------------------------------
+# Utilitários
+# ------------------------------------------------------------------------------
+
+limpar_texto <- function(x) {
+  x |>
+    stri_trans_general("Latin-ASCII") |>
+    str_to_upper() |>
+    str_squish()
+}
+
+# Extrai subclasses usando o padrão hierárquico das versões 2.0+
+# Colunas esperadas por posição: 1=Seção, 2=Divisão, 3=Grupo, 4=Classe, 5=Subclasse, 6=Denominação
+processar_v2x <- function(arquivo, versao) {
+  raw <- tryCatch(
+    read_excel(arquivo, sheet = 1, col_types = "text"),
+    error = function(e) {
+      message(glue("  ⚠ Erro ao ler {arquivo}: {e$message}"))
+      return(NULL)
+    }
+  )
+  if (is.null(raw)) return(NULL)
+
+  # Confirma que há pelo menos 6 colunas
+  if (ncol(raw) < 6) {
+    message(glue("  ⚠ CNAE {versao}: número de colunas inesperado ({ncol(raw)}). Verifique manualmente."))
+    return(NULL)
+  }
+
+  raw |>
+    rename(
+      cod_secao     = 1,
+      cod_divisao   = 2,
+      cod_grupo     = 3,
+      cod_classe    = 4,
+      cod_subclasse = 5,
+      nome_original = 6
+    ) |>
+    mutate(across(c(cod_secao, cod_divisao, cod_grupo, cod_classe), ~ na_if(.x, ""))) |>
+    tidyr::fill(cod_secao, cod_divisao, cod_grupo, cod_classe, .direction = "down") |>
+    filter(!is.na(cod_subclasse), str_detect(cod_subclasse, "\\d")) |>
+    mutate(
+      nome_subclasse = limpar_texto(nome_original),
+      versao_cnae    = versao
+    ) |>
+    select(versao_cnae, cod_secao, cod_divisao, cod_grupo, cod_classe,
+           cod_subclasse, nome_subclasse, nome_original)
+}
+
+# Versões com 5 colunas: nível de Classe (sem Subclasse)
+# Layout: Seção | Divisão | Grupo | Classe | Denominação
+# Usado por: CNAE 2.0 Classes, CNAE 1.0, CNAE (original)
+processar_v_classes <- function(arquivo, versao) {
+  raw <- tryCatch(
+    read_excel(arquivo, sheet = 1, col_types = "text"),
+    error = function(e) {
+      message(glue("  ⚠ Erro ao ler {arquivo}: {e$message}"))
+      return(NULL)
+    }
+  )
+  if (is.null(raw)) return(NULL)
+
+  if (ncol(raw) < 5) {
+    message(glue("  ⚠ {versao}: apenas {ncol(raw)} colunas. Pulando."))
+    return(NULL)
+  }
+
+  raw |>
+    rename(
+      cod_secao     = 1,
+      cod_divisao   = 2,
+      cod_grupo     = 3,
+      cod_classe    = 4,
+      nome_original = 5
+    ) |>
+    mutate(across(c(cod_secao, cod_divisao, cod_grupo), ~ na_if(.x, ""))) |>
+    tidyr::fill(cod_secao, cod_divisao, cod_grupo, .direction = "down") |>
+    filter(!is.na(cod_classe), str_detect(cod_classe, "\\d")) |>
+    mutate(
+      cod_subclasse  = NA_character_,   # sem subclasse neste nível
+      nome_subclasse = limpar_texto(nome_original),
+      versao_cnae    = versao
+    ) |>
+    select(versao_cnae, cod_secao, cod_divisao, cod_grupo, cod_classe,
+           cod_subclasse, nome_subclasse, nome_original)
+}
+
+# CNAE-Domiciliar 2.0: 4 colunas — Grupo | Classe | Subclasse | Denominação
+# (sem Seção nem Divisão explícitas)
+processar_domiciliar_2x <- function(arquivo, versao) {
+  raw <- tryCatch(
+    read_excel(arquivo, sheet = 1, col_types = "text"),
+    error = function(e) {
+      message(glue("  ⚠ Erro ao ler {arquivo}: {e$message}"))
+      return(NULL)
+    }
+  )
+  if (is.null(raw)) return(NULL)
+
+  if (ncol(raw) < 4) {
+    message(glue("  ⚠ {versao}: apenas {ncol(raw)} colunas. Pulando."))
+    return(NULL)
+  }
+
+  raw |>
+    rename(
+      cod_grupo     = 1,
+      cod_classe    = 2,
+      cod_subclasse = 3,
+      nome_original = 4
+    ) |>
+    mutate(across(c(cod_grupo, cod_classe), ~ na_if(.x, ""))) |>
+    tidyr::fill(cod_grupo, cod_classe, .direction = "down") |>
+    filter(!is.na(cod_subclasse), str_detect(cod_subclasse, "\\d")) |>
+    mutate(
+      cod_secao      = NA_character_,
+      cod_divisao    = NA_character_,
+      nome_subclasse = limpar_texto(nome_original),
+      versao_cnae    = versao
+    ) |>
+    select(versao_cnae, cod_secao, cod_divisao, cod_grupo, cod_classe,
+           cod_subclasse, nome_subclasse, nome_original)
+}
+
+# CNAE-Domiciliar (original): 2 colunas — Código | Denominação
+processar_domiciliar_orig <- function(arquivo, versao) {
+  raw <- tryCatch(
+    read_excel(arquivo, sheet = 1, col_types = "text"),
+    error = function(e) {
+      message(glue("  ⚠ Erro ao ler {arquivo}: {e$message}"))
+      return(NULL)
+    }
+  )
+  if (is.null(raw)) return(NULL)
+
+  if (ncol(raw) < 2) {
+    message(glue("  ⚠ {versao}: apenas {ncol(raw)} colunas. Pulando."))
+    return(NULL)
+  }
+
+  raw |>
+    rename(
+      cod_subclasse = 1,
+      nome_original = 2
+    ) |>
+    filter(!is.na(cod_subclasse), str_detect(cod_subclasse, "\\d")) |>
+    mutate(
+      cod_secao      = NA_character_,
+      cod_divisao    = NA_character_,
+      cod_grupo      = NA_character_,
+      cod_classe     = NA_character_,
+      nome_subclasse = limpar_texto(nome_original),
+      versao_cnae    = versao
+    ) |>
+    select(versao_cnae, cod_secao, cod_divisao, cod_grupo, cod_classe,
+           cod_subclasse, nome_subclasse, nome_original)
+}
+
+# ------------------------------------------------------------------------------
+# Leitura do manifesto
+# ------------------------------------------------------------------------------
+
+manifest_path <- "coleta/dados_brutos/manifest_cnae.csv"
+
+if (!file.exists(manifest_path)) {
+  stop("Manifesto não encontrado. Execute coleta/coleta_cnae.R primeiro.")
+}
+
+manifest <- read_csv(manifest_path, show_col_types = FALSE,
+                     col_types = cols(.default = col_character())) |>
+  filter(status %in% c("baixado", "existente"))
+
+if (nrow(manifest) == 0) {
+  stop("Nenhum arquivo coletado com sucesso. Verifique coleta/dados_brutos/.")
+}
+
+# ------------------------------------------------------------------------------
+# Processamento por versão
+# ------------------------------------------------------------------------------
+
+resultados <- list()
+
+for (i in seq_len(nrow(manifest))) {
+  ver      <- manifest$classificacao[i]   # ex: "CNAE 2.3 Subclasses"
+  label    <- manifest$versao_label[i]    # ex: "cnae_2_3_subclasses"
+  arquivo  <- manifest$arquivo_local[i]
+
+  if (!file.exists(arquivo)) {
+    message(glue("⚠ Arquivo não encontrado: {arquivo}"))
+    next
+  }
+
+  message(glue("🔧 Processando: {ver}..."))
+
+  df <- dplyr::case_when(
+    # 6 colunas — versões com subclasse (2.0 subclasses, 2.1, 2.2, 2.3, Fiscal 1.1)
+    TRUE ~ "v2x"
+  )
+
+  # Roteamento por número de colunas + nome
+  n_cols <- tryCatch(
+    ncol(read_excel(arquivo, sheet = 1, col_types = "text", n_max = 3)),
+    error = function(e) 0L
+  )
+
+  df <- if (grepl("domiciliar_2", label)) {
+    processar_domiciliar_2x(arquivo, ver)
+  } else if (grepl("domiciliar", label)) {
+    processar_domiciliar_orig(arquivo, ver)
+  } else if (n_cols >= 6) {
+    processar_v2x(arquivo, ver)
+  } else if (n_cols == 5) {
+    processar_v_classes(arquivo, ver)
+  } else {
+    message(glue("  ⚠ {ver}: {n_cols} colunas — estrutura não reconhecida. Pulando."))
+    NULL
+  }
+
+  if (!is.null(df) && nrow(df) > 0) {
+    resultados[[label]] <- df
+
+    saida_ver <- glue("processamento/dados_processados/{label}.csv")
+    write_csv(df, saida_ver)
+    message(glue("  ✅ {nrow(df)} subclasses → {saida_ver}"))
+  }
+}
+
+# ------------------------------------------------------------------------------
+# Base empilhada (todas as versões)
+# ------------------------------------------------------------------------------
+
+if (length(resultados) > 0) {
+  cnae_todas <- bind_rows(resultados)
+  write_csv(cnae_todas, "processamento/dados_processados/cnae_todas_versoes.csv")
+
+  message("\n=== Resumo do processamento ===")
+  cnae_todas |>
+    count(versao_cnae, name = "n_subclasses") |>
+    print()
+
+  message(glue("Total combinado: {nrow(cnae_todas)} registros"))
+  message("Arquivo consolidado: processamento/dados_processados/cnae_todas_versoes.csv")
+} else {
+  message("⚠ Nenhuma versão foi processada com sucesso.")
+}

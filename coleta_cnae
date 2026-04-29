@@ -1,0 +1,133 @@
+# ==============================================================================
+# COLETA — CNAE (todas as versões disponíveis)
+# Fonte: CONCLA/IBGE — página de downloads
+# URL da página: https://cnae.ibge.gov.br/classificacoes/download-concla/8265-download
+# Pasta de saída: coleta/dados_brutos/
+# ==============================================================================
+# O script raspa a tabela de downloads do CONCLA e baixa automaticamente todos
+# os arquivos XLS/XLSX de estrutura detalhada das classificações CNAE.
+# Nenhuma URL é fixada em código — novas versões são capturadas sem alteração.
+# ==============================================================================
+
+library(rvest)
+library(httr2)
+library(dplyr)
+library(readr)
+library(glue)
+library(stringr)
+
+dir.create("coleta/dados_brutos", recursive = TRUE, showWarnings = FALSE)
+
+PAGE_URL <- "https://cnae.ibge.gov.br/classificacoes/download-concla/8265-download"
+BASE_URL <- "https://cnae.ibge.gov.br"
+
+# ------------------------------------------------------------------------------
+# 1. RASPAGEM DA TABELA DE DOWNLOADS
+# ------------------------------------------------------------------------------
+
+message("Acessando página de downloads do CONCLA...")
+
+pagina <- tryCatch(
+  read_html(PAGE_URL),
+  error = function(e) stop(glue("Falha ao acessar {PAGE_URL}: {e$message}"))
+)
+
+# Cada linha da tabela: <td>Classificação</td> <td><a href=...>Excel</a></td> ...
+linhas <- pagina |> html_nodes("table tr")
+
+extrair_linha <- function(linha) {
+  cels <- html_nodes(linha, "td")
+  if (length(cels) < 2) return(NULL)
+
+  classificacao <- html_text(cels[[1]], trim = TRUE)
+
+  # Coluna 2 = "Estrutura Detalhada" — queremos o link Excel
+  link_node <- html_node(cels[[2]], "a")
+  if (is.na(link_node) || is.null(link_node)) return(NULL)
+
+  href <- html_attr(link_node, "href")
+  if (is.na(href) || !grepl("\\.(xls|xlsx)$", href, ignore.case = TRUE)) return(NULL)
+
+  ext <- tolower(regmatches(href, regexpr("(?i)(xlsx|xls)$", href, perl = TRUE)))
+
+  data.frame(
+    classificacao = classificacao,
+    url           = paste0(BASE_URL, utils::URLencode(href)),
+    ext           = ext,
+    stringsAsFactors = FALSE
+  )
+}
+
+versoes_raw <- do.call(rbind, Filter(Negate(is.null), lapply(linhas, extrair_linha)))
+
+if (is.null(versoes_raw) || nrow(versoes_raw) == 0) {
+  stop("Nenhum link encontrado na página. Verifique se a estrutura HTML mudou.")
+}
+
+# ------------------------------------------------------------------------------
+# 2. FILTRAGEM — apenas classificações CNAE (exclui PRODLIST, Ocupação, etc.)
+# ------------------------------------------------------------------------------
+
+versoes <- versoes_raw[grepl("^CNAE", versoes_raw$classificacao, ignore.case = TRUE), ]
+
+versoes$versao_label <- tolower(
+  gsub("[^A-Za-z0-9_\\-]", "_",
+    gsub("\\s+", "_", versoes$classificacao)
+  )
+)
+versoes$arquivo_local <- paste0("coleta/dados_brutos/", versoes$versao_label, ".", versoes$ext)
+
+message(paste0("\n", nrow(versoes), " versoes CNAE encontradas na pagina:"))
+print(versoes[, c("classificacao", "url")])
+
+# ------------------------------------------------------------------------------
+# 3. DOWNLOAD
+# ------------------------------------------------------------------------------
+
+versoes$status        <- "pendente"
+versoes$data_coleta   <- NA_character_
+versoes$tamanho_bytes <- NA_integer_
+
+for (i in seq_len(nrow(versoes))) {
+  destino <- versoes$arquivo_local[i]
+  nome    <- versoes$classificacao[i]
+
+  if (file.exists(destino)) {
+    message(glue("Pulando (ja existe): {nome}"))
+    versoes$status[i]        <- "existente"
+    versoes$data_coleta[i]   <- as.character(file.info(destino)$mtime)
+    versoes$tamanho_bytes[i] <- file.info(destino)$size
+    next
+  }
+
+  message(glue("Baixando: {nome}..."), appendLF = FALSE)
+
+  ok <- tryCatch({
+    download.file(versoes$url[i], destino, mode = "wb", quiet = TRUE)
+    TRUE
+  }, error = function(e) {
+    message(glue(" FALHA: {e$message}"))
+    FALSE
+  })
+
+  if (ok) {
+    versoes$status[i]        <- "baixado"
+    versoes$data_coleta[i]   <- as.character(Sys.time())
+    versoes$tamanho_bytes[i] <- file.info(destino)$size
+    message(glue(" OK ({round(versoes$tamanho_bytes[i] / 1024)} KB)"))
+  } else {
+    versoes$status[i] <- "falha"
+  }
+}
+
+# ------------------------------------------------------------------------------
+# 4. MANIFESTO
+# ------------------------------------------------------------------------------
+
+manifest_saida <- versoes[, c("classificacao", "versao_label", "url",
+                               "arquivo_local", "status", "data_coleta", "tamanho_bytes")]
+write.csv(manifest_saida, "coleta/dados_brutos/manifest_cnae.csv", row.names = FALSE)
+
+message("\n=== Resumo da coleta ===")
+print(manifest_saida[, c("classificacao", "status", "tamanho_bytes")])
+message("Manifesto salvo em coleta/dados_brutos/manifest_cnae.csv")
